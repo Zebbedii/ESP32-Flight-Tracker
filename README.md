@@ -17,6 +17,19 @@ XPT2046_Touchscreen 1.4
 A case has been made for the ESP32 Board.
 This is avalible here:
 
+# RGB565
+https://marlinfw.org/tools/rgb565/converter.html was used to convert the map png from QGIS to rgb565
 
-  
+The header should be modified so that it reads:
+
+#include <pgmspace.h> 
+
+// Define the array once, with PROGMEM, so it ONLY goes to Flash memory.
+// 320 * 240 = 76800
+const uint16_t map_data[320*240] PROGMEM = {
+
+and the footer should only contain: 
+
+};
+
 
