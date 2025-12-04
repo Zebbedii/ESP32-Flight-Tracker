@@ -11,12 +11,16 @@ The version of TFT_eSPI used did not offer support for the esp32-2432s028, a cus
 
 # Arduino IDE 2.3.6 Libraries
 Arduino_JSON 0.2.0
+
 Arduinojson 7.4.2
+
 TFT_eSPI 2.5.43
+
 XPT2046_Touchscreen 1.4
 
 # Case 
 A case has been made for the ESP32 Board.
+
 This is avalible here:
 
 # RGB565
