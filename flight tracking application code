@@ -1,0 +1,472 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include "FS.h"
+#include "SPIFFS.h"
+#include <time.h>
+#include <pgmspace.h>
+#include <ctype.h> 
+#include <vector> 
+#include <cmath> 
+#include <algorithm> 
+
+// -----------------------------------------------------------------
+// Map Data (RGB565, stored in Flash)
+// NOTE: Assuming map_data.h defines a const uint16_t map_data[]
+// -----------------------------------------------------------------
+#include "map_data.h"
+
+// ==========================
+// WiFi Credentials 
+// ==========================
+const char* ssid = "YOUR_WIFI_SSID";          // 
+const char* password = "YOUR_WIFI_PASSWORD";  // 
+
+// ==========================
+// OpenSky OAuth2 Credentials
+// ==========================
+const char* opensky_client_id = "YOUR_OPENSKY_APIKEY"; //
+const char* opensky_client_secret = "YOUR_OPENSKY_SECRET"; // 
+
+// Token storage variables
+String opensky_token = "";
+unsigned long token_expiry_time = 0;
+
+// ==========================
+// Geographic Bounding Box (MATCHES MAP DATA)
+// ==========================
+const double centreLat = 55.9620685;
+const double centreLon = -3.375663;
+const double deltaLat = 0.1425445;
+const double deltaLon = 0.340349;
+
+const double latMax = centreLat + deltaLat;
+const double latMin = centreLat - deltaLat;
+const double lonMax = centreLon + deltaLon;
+const double lonMin = centreLon - deltaLon;
+
+// ==========================
+// Display & API Settings
+// REFRESH RATE IS 2 MINUTES (120 seconds) to avoid API limit
+const int screenW = 320;
+const int screenH = 240;
+const int HEADER_H = 20; // Height of the black header bar
+const unsigned long UPDATE_INTERVAL = 120000; // 2 minutes
+unsigned long lastUpdate = 0;
+const unsigned long CACHE_EXPIRY = 3 * 3600;
+
+// *** CRITICAL FIX: Manually set TRAIL_POINTS to a safe integer ***
+const int TRAIL_POINTS = 5; 
+#define TFT_BL 21
+TFT_eSPI tft = TFT_eSPI();
+
+// === SPRITE DECLARATION ===
+TFT_eSprite textSprite = TFT_eSprite(&tft);  // For Call signs
+TFT_eSprite headerSprite = TFT_eSprite(&tft); // For Header Text
+// ==========================
+
+// ==========================
+// Plane Data Structure
+// ==========================
+struct Position { int x; int y; };
+struct Plane {
+    String icao24; String callsign; double currentLat; double currentLon;
+    std::vector<Position> trail; unsigned long lastUpdateTime; bool isVisible; 
+    int lastX = -1; int lastY = -1;
+};
+std::vector<Plane> activePlanes;
+
+// ==========================
+// Coordinate Mapping
+// ==========================
+int lonToX(double lon) { return (int)(((lon - lonMin) / (lonMax - lonMin)) * screenW); }
+int latToY(double lat) { return (int)(screenH - ((lat - latMin) / (latMax - latMin)) * screenH); }
+
+// ==========================
+// Callsign Cleaning
+// ==========================
+String cleanCallsign(const String& rawCallsign) {
+    String clean = ""; String trimmed = rawCallsign; trimmed.trim(); 
+    for (int i = 0; i < trimmed.length(); i++) {
+        char c = trimmed.charAt(i);
+        if (isalnum(c) || c == '-') { clean += c; }
+    }
+    return clean;
+}
+
+// ==========================
+// Clear Map Area (Uses Byte Swap)
+// ==========================
+void clearMapArea(int x, int y, int w, int h) {
+    if (y < HEADER_H) { h -= (HEADER_H - y); y = HEADER_H; }
+    if (w <= 0 || h <= 0) return;
+    size_t start_index = (y * screenW) + x;
+    
+    tft.setSwapBytes(true); // Enable swap for image push
+    // NOTE: This assumes map_data is one contiguous array of screenW * screenH elements.
+    tft.pushImage(x, y, w, h, (const uint16_t*)&map_data[start_index]);
+    tft.setSwapBytes(false); // Disable swap for colors/shapes
+}
+
+// ==========================
+// Header Update (Sprite-based using built-in Font 2)
+// FIXED: Ensures proper clearing for time text to prevent overlap
+// ==========================
+void updateHeader(bool cached) {
+    // 1. Clear and set up the header sprite
+    headerSprite.fillScreen(TFT_BLACK);
+    headerSprite.setTextColor(TFT_YELLOW, TFT_BLACK); 
+    
+    // Using the now-available built-in Font 2
+    headerSprite.setTextFont(2); 
+    headerSprite.setTextSize(1);
+    
+    // 2. Draw Plane Count to Sprite (Y pos adjusted for Font 2)
+    headerSprite.setCursor(5, 4); // Centered Font 2 in 20px bar
+    headerSprite.printf("PLANES: %d%s", activePlanes.size(), cached ? " (CACHED)" : "");
+
+    // 3. Draw Time to Sprite
+    time_t nowTime = time(nullptr);
+    struct tm * timeinfo = localtime(&nowTime);
+    char timeStr[12];
+    
+    // Check if time is synced
+    if (nowTime < 1000000000) { 
+        strcpy(timeStr, "SYNCING...");
+    } else {
+        strftime(timeStr, sizeof(timeStr), "%H:%M:%S", timeinfo);
+    }
+    
+    // *** FIX: Explicitly clear the area for the time display before printing. ***
+    // Width 85px is sufficient for "SYNCING..." + padding, right-aligned.
+    headerSprite.fillRect(screenW - 85, 0, 85, HEADER_H, TFT_BLACK);
+    
+    // Calculate width to right-align the time
+    int timeWidth = headerSprite.textWidth(timeStr); 
+    headerSprite.setCursor(screenW - timeWidth - 5, 4); 
+    headerSprite.print(timeStr);
+
+    // 4. Push the completed sprite to the screen (reliable)
+    headerSprite.pushSprite(0, 0); 
+}
+
+// ==========================
+// Display Planes (Hybrid Drawing)
+// ==========================
+void displayPlanesOptimized(const String &payload, bool cached) {
+    // Parse JSON
+    DynamicJsonDocument doc(16384);
+    if (deserializeJson(doc, payload)) return;
+    JsonArray states;
+    if (doc.containsKey("states")) states = doc["states"].as<JsonArray>();
+    else if (doc.containsKey("ac")) states = doc["ac"].as<JsonArray>();
+    else return;
+    
+    // --- PHASE 1: CLEAR OLD DATA ---
+    for (Plane& p : activePlanes) {
+        if (p.lastX != -1 && p.lastY >= HEADER_H) { clearMapArea(p.lastX - 4, p.lastY - 8, 80, 16); }
+    }
+    // Clear old trails (redraw map section)
+    tft.setSwapBytes(true); // Enable swap for image push
+    tft.pushImage(0, HEADER_H, screenW, screenH - HEADER_H, (const uint16_t*)&map_data[HEADER_H * screenW]);
+    tft.setSwapBytes(false); // Disable swap for colors/shapes
+
+    // Mark all planes invisible
+    for (Plane& p : activePlanes) p.isVisible = false;
+
+    // --- PHASE 2: DATA PROCESSING ---
+    for (JsonVariant v : states) {
+        double lat = NAN, lon = NAN; String icao = "", rawCallsign = "";
+        if (v.is<JsonArray>()) {
+            JsonArray a = v.as<JsonArray>();
+            if (a[6].is<double>() && a[5].is<double>() && a[0].is<const char*>()) {
+                icao = a[0].as<String>(); lat = a[6]; lon = a[5];
+                if (a[1].is<const char*>()) rawCallsign = a[1].as<String>();
+            }
+        } else if (v.is<JsonObject>()) {
+            JsonObject o = v.as<JsonObject>();
+            if (o.containsKey("lat") && o.containsKey("lon") && o.containsKey("hex")) {
+                icao = o["hex"].as<String>(); lat = o["lat"]; lon = o["lon"];
+                if (o.containsKey("call") && o["call"].is<const char*>()) rawCallsign = o["call"].as<String>();
+            }
+        }
+        if (isnan(lat) || isnan(lon) || icao.length() == 0) continue;
+        if (lat < latMin || lat > latMax || lon < lonMin || lon > lonMax) continue;
+        String cleanCs = cleanCallsign(rawCallsign); int x = lonToX(lon), y = latToY(lat);
+        auto it = std::find_if(activePlanes.begin(), activePlanes.end(), [&](Plane& p){ return p.icao24 == icao; });
+        if (it != activePlanes.end()) {
+            it->currentLat = lat; it->currentLon = lon;
+            if(cleanCs.length() > 0) it->callsign = cleanCs;
+            it->lastUpdateTime = millis(); it->isVisible = true;
+            it->trail.push_back({x, y});
+            if (it->trail.size() > TRAIL_POINTS) it->trail.erase(it->trail.begin());
+            it->lastX = x; it->lastY = y;
+        } else {
+            Plane newPlane; newPlane.icao24 = icao; newPlane.callsign = cleanCs;
+            newPlane.currentLat = lat; newPlane.currentLon = lon;
+            newPlane.lastUpdateTime = millis(); newPlane.isVisible = true;
+            newPlane.trail.push_back({x, y}); activePlanes.push_back(newPlane);
+            newPlane.lastX = x; newPlane.lastY = y;
+        }
+    }
+    // Remove invisible planes
+    activePlanes.erase(
+        std::remove_if(activePlanes.begin(), activePlanes.end(),
+                        [](const Plane& p){ return !p.isVisible; }),
+        activePlanes.end()
+    );
+
+    // --- PHASE 3: DRAW NEW DATA DIRECTLY TO TFT ---
+    
+    // Draw trails directly to TFT
+    for (Plane& p : activePlanes) {
+        if (p.trail.size() < 2) continue;
+        uint16_t trailColor = TFT_DARKGREY; 
+        for (size_t i = 1; i < p.trail.size(); i++) {
+            if (p.trail[i-1].y >= HEADER_H && p.trail[i].y >= HEADER_H) {
+                tft.drawLine( p.trail[i-1].x, p.trail[i-1].y, p.trail[i].x, p.trail[i].y, trailColor );
+            }
+        }
+    }
+
+    // Draw planes and callsigns (using temporary sprite, which is confirmed to work)
+    for (const Plane& p : activePlanes) {
+        int x = lonToX(p.currentLon), y = latToY(p.currentLat);
+        if (x >= 0 && x < screenW && y >= HEADER_H && y < screenH) {
+            tft.fillCircle(x, y, 3, TFT_RED); 
+
+            if (p.callsign.length() > 0) {
+                // Ensure textSprite is created large enough for the longest possible callsign
+                int textWidth = 6 * p.callsign.length(); 
+                if (!textSprite.created()) textSprite.createSprite(textWidth + 2, 12);
+                
+                // If it's too small for the current callsign, create a new one.
+                if (textWidth + 2 > textSprite.width()) {
+                    textSprite.deleteSprite();
+                    textSprite.createSprite(textWidth + 2, 12);
+                }
+                
+                textSprite.fillScreen(TFT_BLACK); 
+                textSprite.setTextColor(TFT_WHITE, TFT_BLACK); 
+                textSprite.setTextFont(1); 
+                textSprite.setTextSize(1);
+                textSprite.setCursor(0, 4);
+                textSprite.print(p.callsign); 
+                textSprite.pushSprite(x + 5, y - 8); 
+            }
+        }
+    }
+}
+
+// ==========================
+// Setup (Final Reliable Configuration)
+// ==========================
+void setup() {
+    Serial.begin(115200);
+
+    if (!SPIFFS.begin(true)) Serial.println("SPIFFS Mount Failed");
+
+    tft.init();
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
+
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH);
+    
+    // Initialize the Header Sprite
+    headerSprite.createSprite(screenW, HEADER_H);
+
+    // --- STATIC MAP DRAW (Byte Swap Controlled) ---
+    tft.setSwapBytes(true); 
+    tft.pushImage(0, 0, screenW, screenH, (const uint16_t*)map_data);
+    tft.setSwapBytes(false); // CRUCIAL FIX: Disable swapping for colors/shapes
+    
+    // Draw the initial black header area
+    tft.fillRect(0, 0, screenW, HEADER_H, TFT_BLACK);
+
+    // Initial message sequence (will display SYNCING... until NTP sync)
+    updateHeader(false); 
+
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(300);
+        Serial.print(".");
+    }
+
+    Serial.println("\nWiFi connected.");
+    
+    // NTP
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    while (time(nullptr) < 100000) { 
+        delay(200); 
+        // Update header while syncing so user sees "SYNCING..."
+        updateHeader(false); 
+    }
+
+    Serial.printf("API Bounds: Lat (%.6f to %.6f), Lon (%.6f to %.6f)\n",
+                  latMin, latMax, lonMin, lonMax);
+
+    getOpenSkyToken();
+    // Initialize lastUpdate to ensure API runs on the very first loop
+    lastUpdate = millis() - UPDATE_INTERVAL; 
+}
+
+// ==========================
+// API & Cache Functions
+// ==========================
+void getOpenSkyToken() {
+    if (time(nullptr) < token_expiry_time) return;
+    Serial.println("Token expired or missing. Requesting new token...");
+    HTTPClient http;
+    const char* tokenUrl = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
+    http.begin(tokenUrl);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    String postData = "grant_type=client_credentials&client_id=";
+    postData += opensky_client_id;
+    postData += "&client_secret=";
+    postData += opensky_client_secret;
+    int code = http.POST(postData);
+    if (code == HTTP_CODE_OK) {
+        DynamicJsonDocument doc(1024);
+        DeserializationError error = deserializeJson(doc, http.getString());
+        if (!error && doc.containsKey("access_token") && doc.containsKey("expires_in")) {
+            opensky_token = doc["access_token"].as<String>();
+            unsigned long expiresIn = doc["expires_in"].as<unsigned long>();
+            token_expiry_time = time(nullptr) + expiresIn - 60; 
+            Serial.println("OpenSky token received and stored.");
+        } else {
+            Serial.printf("Token JSON Error: %s\n", error.c_str());
+            opensky_token = "";
+        }
+    } else {
+        Serial.printf("Token request failed. HTTP: %d\n", code);
+        opensky_token = "";
+    }
+    http.end();
+}
+
+String getFlightData() {
+    getOpenSkyToken(); 
+    if (opensky_token.length() > 0) { 
+        char url_buf[256];
+        snprintf(url_buf, sizeof(url_buf),
+            "https://opensky-network.org/api/states/all?lamin=%.6f&lamax=%.6f&lomin=%.6f&lomax=%.6f",
+            latMin, latMax, lonMin, lonMax);
+        HTTPClient http;
+        http.begin(url_buf);
+        String authHeader = "Bearer " + opensky_token;
+        http.addHeader("Authorization", authHeader);
+        int code = http.GET();
+        Serial.printf("OpenSky HTTP: %d\n", code);
+        if (code == HTTP_CODE_OK) {
+            String payload = http.getString();
+            http.end();
+            if (payload.indexOf("\"states\":null") < 0 && payload.indexOf("\"states\":") > 0) {
+                Serial.println("OpenSky OK (OAuth2)");
+                return payload;
+            }
+        }
+        http.end();
+    }
+    // ADSBexchange fallback (Public, no API key needed)
+    char url_buf[256];
+    snprintf(url_buf, sizeof(url_buf),
+        "https://public-api.adsbexchange.com/geo?latmin=%.6f&latmax=%.6f&lonmin=%.6f&lonmax=%.6f",
+        latMin, latMax, lonMin, lonMax);
+    HTTPClient http;
+    http.begin(url_buf);
+    int code = http.GET();
+    Serial.printf("ADSBexchange HTTP: %d\n", code);
+    if (code == HTTP_CODE_OK) {
+        String payload = http.getString();
+        http.end();
+        Serial.println("ADSBexchange OK");
+        return payload;
+    }
+    http.end();
+    Serial.println("All APIs failed!");
+    return "";
+}
+
+void saveCache(const String &json) {
+    if (!SPIFFS.begin(false)) return;
+    fs::File file = SPIFFS.open("/planes.json", FILE_WRITE);
+    if (file) { file.print(json); file.close(); }
+    time_t nowTime = time(nullptr);
+    fs::File tfile = SPIFFS.open("/planes_time.txt", FILE_WRITE);
+    if (tfile) { tfile.print(String((unsigned long)nowTime)); tfile.close(); }
+}
+
+String loadCache(bool &expired) {
+    expired = false;
+    if (!SPIFFS.begin(false)) return "";
+    fs::File tfile = SPIFFS.open("/planes_time.txt", FILE_READ);
+    if (!tfile) return "";
+    unsigned long savedTime = tfile.readString().toInt();
+    tfile.close();
+    unsigned long nowTime = time(nullptr);
+    if (nowTime - savedTime > CACHE_EXPIRY) expired = true;
+    fs::File file = SPIFFS.open("/planes.json", FILE_READ);
+    if (!file) return "";
+    String data = file.readString();
+    file.close();
+    return data;
+}
+
+
+// ==========================
+// Main Loop
+// ==========================
+void loop() {
+    static unsigned long lastHeaderUpdate = 0;
+    unsigned long nowMillis = millis();
+
+    String payload = "";
+    bool cached = false, expired = false;
+    bool api_failed = false; 
+
+    // --- 1. DATA FETCHING (Only runs every 2 minutes) ---
+    if (WiFi.status() == WL_CONNECTED && nowMillis - lastUpdate > UPDATE_INTERVAL) {
+        payload = getFlightData();
+        if (payload.length() > 0) {
+            saveCache(payload);
+        } else { 
+            payload = loadCache(expired); 
+            cached = true; 
+            api_failed = true; 
+        } 
+        lastUpdate = nowMillis;
+    } else if (WiFi.status() != WL_CONNECTED) {
+        payload = loadCache(expired);
+        cached = true;
+        api_failed = true; 
+    }
+
+    // --- 2. DISPLAY PLANE DATA ---
+    if (payload.length() > 0) {
+        displayPlanesOptimized(payload, cached);
+    }
+    
+    // --- 3. ERROR MESSAGE / HEADER UPDATE (runs every second) ---
+    if (nowMillis - lastHeaderUpdate > 1000) {
+        
+        if (payload.length() == 0 && api_failed) {
+            // Display RED error bar if API/Cache failed
+            headerSprite.fillRect(0, 0, screenW, HEADER_H, TFT_RED);
+            headerSprite.setTextColor(TFT_WHITE, TFT_RED);
+            headerSprite.setTextFont(2); 
+            headerSprite.setCursor(5, 3);
+            headerSprite.print("NO DATA / CONNECTION ERROR");
+            headerSprite.pushSprite(0, 0);
+        } else {
+            // Display normal header (updates time and plane count)
+            updateHeader(cached); 
+        }
+
+        lastHeaderUpdate = nowMillis;
+    }
+
+    delay(50);
+}
