@@ -4,6 +4,8 @@ ESP32-2432s028 Flight Tracker Using OpenSky
 # Map Generation:
 Maps were created using QGIS Desktop 3.40.13 with the QuickOSM and QuickMapServices plugins.
 
+QGIS is avalible here - https://qgis.org/download/
+
 # Custom TFT_eSPI User Set up
 The version of TFT_eSPI used did not offer support for the esp32-2432s028, a custom user setup file is included here.
 
